@@ -1224,7 +1224,11 @@ void retro_get_system_info(struct retro_system_info *info)
    memset(info, 0, sizeof(*info));
    info->library_name     = "PCSX-ReARMed";
    info->library_version  = "r26" GIT_VERSION;
-   info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe";
+   info->valid_extensions = "bin|cue|img|mdf|pbp|toc|cbn|m3u|chd|iso|exe"
+#ifdef HAVE_PSXRC
+      "|psxrc"
+#endif
+      ;
    info->need_fullpath    = true;
 }
 
@@ -2503,6 +2507,11 @@ static void update_variables(bool in_flight)
    }
 
    show_info_notifications = get_bool_variable("pcsx_rearmed_display_info");
+
+#ifdef HAVE_PSXRC
+   ISOsetDirectAudio(get_bool_variable("pcsx_rearmed_psxrc_direct_audio"));
+   ISOsetDirectVideo(get_bool_variable("pcsx_rearmed_psxrc_direct_h264"));
+#endif
 
    var.value = NULL;
    var.key = "pcsx_rearmed_cd_turbo";

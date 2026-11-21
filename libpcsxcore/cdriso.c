@@ -31,6 +31,10 @@
 #ifdef HAVE_CHD
 #include <libchdr/chd.h>
 #endif
+#ifdef HAVE_PSXRC
+#include <psxrc.h>
+#include "mdec.h"
+#endif
 
 #ifdef _WIN32
 #define strcasecmp _stricmp
@@ -59,6 +63,11 @@ unsigned int cdrIsoMultidiskSelect;
 
 static FILE *cdHandle = NULL;
 static FILE *subHandle = NULL;
+#ifdef HAVE_PSXRC
+static psxrc *psxrc_img;
+static int psxrc_direct_audio_requested, psxrc_direct_audio;
+static int psxrc_direct_video_requested;
+#endif
 
 static boolean subChanMixed = FALSE;
 static boolean subChanRaw = FALSE;
@@ -1499,6 +1508,69 @@ static void PrintTracks(void) {
 
 // This function is invoked by the front-end when opening an ISO
 // file for playback
+#ifdef HAVE_PSXRC
+static int psxrc_io(void *context, uint64_t offset, void *dest, size_t size)
+{
+	FILE *file = context;
+	return fseeko(file, offset, SEEK_SET) == 0 && fread(dest, 1, size, file) == size;
+}
+
+static int cdread_psxrc(FILE *file, unsigned int base, void *dest, int sector)
+{
+	(void)file;
+	if (sector < 0 || !psxrc_read_sector(psxrc_img, base + sector, dest ? dest : cdbuffer))
+		return -1;
+	return CD_FRAMESIZE_RAW;
+}
+
+static int cdread_sub_psxrc(FILE *file, int sector, void *dest)
+{
+	(void)file;
+	return sector >= 0 && psxrc_read_subchannel(psxrc_img, sector, dest) ? 0 : -1;
+}
+
+static int handlepsxrc(const char *fname, off_t size)
+{
+	psxrc_img = size > 0 ? psxrc_open(psxrc_io, cdHandle, size) : NULL;
+	if (!psxrc_img) {
+		SysPrintf("Invalid or unsupported PSXRC image: %s\n", fname);
+		ISOclose();
+		return -1;
+	}
+	psxrc_direct_audio = psxrc_direct_audio_requested;
+	if (psxrc_direct_video_requested && psxrc_video_sector_count(psxrc_img)) {
+		psxrc_enable_direct_video(psxrc_img);
+		mdecSetDirectVideo(1);
+	}
+	numtracks = psxrc_track_count(psxrc_img);
+	memset(ti, 0, sizeof(ti));
+	for (int i = 1; i <= numtracks; ++i) {
+		const psxrc_track *track = psxrc_get_track(psxrc_img, i);
+		ti[i].type = track->mode == PSXRC_CDDA ? CDRT_CDDA : CDRT_DATA;
+		ti[i].start = track->index1 + 150;
+		ti[i].start_offset = track->index1;
+		ti[i].length = track->end - track->index1;
+	}
+	cdimg_read_func = cdread_psxrc;
+	if (psxrc_has_subchannel(psxrc_img))
+		cdimg_read_sub_func = cdread_sub_psxrc;
+	size_t sbi_bytes;
+	const uint8_t *sbi = psxrc_sbi_bitmap(psxrc_img, &sbi_bytes);
+	if (sbi) {
+		sbi_sectors = malloc(sbi_bytes);
+		if (sbi_sectors == NULL) {
+			ISOclose();
+			return -1;
+		}
+		memcpy(sbi_sectors, sbi, sbi_bytes);
+		sbi_len = sbi_bytes;
+	}
+	SysPrintf("Loaded PSXRC image: %s\n", fname);
+	PrintTracks();
+	return 0;
+}
+#endif
+
 int ISOopen(const char *fname)
 {
 	boolean isMode1ISO = FALSE;
@@ -1532,6 +1604,12 @@ int ISOopen(const char *fname)
 	ISOgetBuffer = ISOgetBuffer_normal;
 	cdimg_read_func = cdread_normal;
 	cdimg_read_sub_func = NULL;
+
+#ifdef HAVE_PSXRC
+	const char *extension = strrchr(fname, '.');
+	if (extension && !strcasecmp(extension, ".psxrc"))
+		return handlepsxrc(fname, size_main);
+#endif
 
 	if (parsetoc(fname) == 0) {
 		strcat(image_str, "[+toc]");
@@ -1639,6 +1717,11 @@ int ISOclose(void)
 {
 	int i;
 
+#ifdef HAVE_PSXRC
+	mdecSetDirectVideo(0);
+	psxrc_close(psxrc_img);
+	psxrc_img = NULL;
+#endif
 	if (cdHandle != NULL) {
 		fclose(cdHandle);
 		cdHandle = NULL;
@@ -1752,6 +1835,64 @@ static void DecodeRawSubData(unsigned char *subbuffer) {
 // read track
 // time: byte 0 - minute; byte 1 - second; byte 2 - frame (non-bcd)
 // buf: if NULL, data is kept in internal buffer accessible by ISOgetBuffer()
+#ifdef HAVE_PSXRC
+void ISOsetDirectAudio(int enabled)
+{
+	psxrc_direct_audio_requested = enabled;
+}
+
+void ISOsetDirectVideo(int enabled)
+{
+	psxrc_direct_video_requested = enabled;
+}
+
+int ISOvideoHint(uint32_t lba, psxrc_video_hint *hint)
+{
+	return psxrc_img && psxrc_read_video_hint(psxrc_img, lba, hint);
+}
+
+int ISOcopyVideo(uint32_t lba, const psxrc_video_hint *hint, uint8_t *pixels, size_t capacity)
+{
+	return psxrc_img && psxrc_copy_video(psxrc_img, lba, hint, pixels, capacity);
+}
+
+int ISOreadTrackDeferred(const unsigned char *time, void *buf)
+{
+	unsigned int lba = msf2sec(time) - 150;
+	if (psxrc_img && psxrc_direct_audio &&
+	    psxrc_read_xa_template(psxrc_img, lba, buf ? buf : cdbuffer))
+		return 1;
+	return ISOreadTrack(time, buf);
+}
+
+int ISOreadDirectXA(const unsigned char *time, unsigned coding, xa_decode_t *xa)
+{
+	unsigned int lba = msf2sec(time) - 150;
+	unsigned frames, channels = (coding & 1) + 1;
+	if (!psxrc_img || !psxrc_direct_audio)
+		return 0;
+	frames = psxrc_read_xa_pcm(psxrc_img, lba, coding, xa->pcm,
+			sizeof(xa->pcm) / sizeof(xa->pcm[0]));
+	if (!frames)
+		return 0;
+	if (psxrc_direct_audio == 1) {
+		SysPrintf("PSXRC: playing Opus XA audio directly\n");
+		psxrc_direct_audio = 2;
+	}
+	xa->freq = coding & 4 ? 18900 : 37800;
+	xa->nbits = 4;
+	xa->stereo = channels == 2;
+	xa->nsamples = frames;
+	xa->left.y0 = xa->pcm[(frames - 1) * channels];
+	xa->left.y1 = xa->pcm[(frames - 2) * channels];
+	if (xa->stereo) {
+		xa->right.y0 = xa->pcm[(frames - 1) * channels + 1];
+		xa->right.y1 = xa->pcm[(frames - 2) * channels + 1];
+	}
+	return 1;
+}
+#endif
+
 int ISOreadTrack(const unsigned char *time, void *buf)
 {
 	int sector = msf2sec(time);
@@ -1759,6 +1900,11 @@ int ISOreadTrack(const unsigned char *time, void *buf)
 
 	if (!cdHandle && !chd_img)
 		return -1;
+
+#ifdef HAVE_PSXRC
+	if (psxrc_img)
+		return cdread_psxrc(cdHandle, 0, buf, sector - 150) < 0 ? -1 : 0;
+#endif
 
 	if (sector >= ti[1].start + ti[1].length &&
 	    numtracks > 1 && ti[2].type == CDRT_CDDA) {
@@ -1778,6 +1924,11 @@ int ISOreadTrack(const unsigned char *time, void *buf)
 int ISOreadSub(const unsigned char *time, void *buffer)
 {
 	int ret, sector = msf2sec(time);
+
+#ifdef HAVE_PSXRC
+	if (psxrc_img)
+		return cdread_sub_psxrc(cdHandle, sector - 150, buffer);
+#endif
 
 	if (sector >= ti[1].start + ti[1].length) {
 		// for tracks 2+ use the fake data, otherwise
@@ -1813,6 +1964,10 @@ int ISOgetStatus(struct CdrStat *stat)
 	stat->Type = ti[1].type;
 	stat->nodisk = cdHandle == NULL;
 	stat->mode1 = cdimg_read_func == cdread_2048;
+#ifdef HAVE_PSXRC
+	if (psxrc_img)
+		stat->mode1 = psxrc_get_track(psxrc_img, 1)->mode == PSXRC_COOKED_MODE1;
+#endif
 	
 	return 0;
 }
